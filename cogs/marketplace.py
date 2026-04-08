@@ -91,7 +91,7 @@ class MarketplaceCog(commands.Cog):
 
     # ── /plugin ───────────────────────────────────────────────────────────────
 
-    @app_commands.command(name="plugin", description="🧩 View details and download a specific plugin.")
+    @app_commands.command(name="plugin", description="🧩 View info for a specific plugin and jump to its drop.")
     @app_commands.describe(plugin_id="The numeric plugin ID")
     async def plugin_info(self, interaction: discord.Interaction, plugin_id: int):
         await interaction.response.defer()
@@ -106,34 +106,27 @@ class MarketplaceCog(commands.Cog):
         author = interaction.guild.get_member(plugin['author_id'])
         embed  = plugin_embed(plugin, author)
 
-        # Download the actual .jar and attach it to the response
-        import aiohttp, io
-        file_bytes = None
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(plugin['file_url']) as resp:
-                    if resp.status == 200:
-                        file_bytes = await resp.read()
-        except Exception:
-            pass
-
         await self.bot.db.increment_downloads(plugin_id)
 
-        # Include action buttons (Rate / Report) via the view
+        # Build view with Rate/Report buttons + jump-to-drop link
         view = PluginActionView(plugin['id'], self.bot)
 
-        if file_bytes:
-            disc_file = discord.File(
-                io.BytesIO(file_bytes),
-                filename=plugin['file_name'],
-                description=f"{plugin['name']} v{plugin['version']}",
-            )
-            await interaction.followup.send(
-                content=f"📥 **{plugin['name']}** v{plugin['version']} — download the file below:",
-                embed=embed, file=disc_file, view=view,
-            )
-        else:
-            await interaction.followup.send(embed=embed, view=view)
+        # If we have the original drop message, add a "Go to Drop" link button
+        if plugin['msg_id'] and plugin['channel_id']:
+            ch = interaction.guild.get_channel(int(plugin['channel_id']))
+            if ch:
+                try:
+                    msg = await ch.fetch_message(int(plugin['msg_id']))
+                    view.add_item(discord.ui.Button(
+                        label  = "📥 Go to Drop (download file)",
+                        url    = msg.jump_url,
+                        style  = discord.ButtonStyle.link,
+                        emoji  = "📦",
+                    ))
+                except Exception:
+                    pass
+
+        await interaction.followup.send(embed=embed, view=view)
 
     # ── /top ──────────────────────────────────────────────────────────────────
 

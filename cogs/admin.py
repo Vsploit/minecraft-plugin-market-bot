@@ -1,131 +1,20 @@
 """
-Admin cog — approve/reject plugins, manage roles, view reports, server config.
+Admin cog — role management, takedowns, reports, moderation tools.
 
-On approval the bot downloads the plugin file and re-uploads it directly to
-the listings / new-releases channel so users get a native Discord download.
+Plugins no longer need approval — they auto-post to #dropped-plugins the
+moment a dropper submits them. Admins can still force-delete any drop.
 """
 
 import discord
 from discord.ext import commands
 from discord import app_commands
 import logging
-import io
-import aiohttp
 from config import COLORS
 from utils.checks import is_admin, is_moderator
-from utils.embeds import (success_embed, error_embed, info_embed,
-                          plugin_embed, pending_embed, log_embed)
+from utils.embeds import success_embed, error_embed, info_embed, plugin_embed, log_embed
 from utils.checks import get_role_by_name
 
 logger = logging.getLogger('PluginMarket.Admin')
-
-
-class AdminCog(commands.Cog):
-    def __init__(self, bot):
-        self.bot = bot
-
-    # ── /approve ──────────────────────────────────────────────────────────────
-
-    @app_commands.command(name="approve", description="✅ [ADMIN] Approve a submitted plugin.")
-    @app_commands.describe(plugin_id="Plugin ID to approve")
-    @is_moderator()
-    async def approve(self, interaction: discord.Interaction, plugin_id: int):
-        await interaction.response.defer(ephemeral=True)
-        plugin = await self.bot.db.get_plugin(plugin_id)
-        if not plugin:
-            await interaction.followup.send(embed=error_embed("Not Found", "Plugin not found."), ephemeral=True)
-            return
-        if plugin['approved']:
-            await interaction.followup.send(embed=error_embed("Already Approved", "This plugin is already approved."), ephemeral=True)
-            return
-
-        await self.bot.db.approve_plugin(plugin_id)
-
-        # DM author
-        try:
-            author = self.bot.get_user(plugin['author_id'])
-            if author:
-                await author.send(embed=success_embed(
-                    "Plugin Approved! 🎉",
-                    f"Your plugin **{plugin['name']}** v{plugin['version']} has been **approved** and is now live on the marketplace!",
-                ))
-        except Exception:
-            pass
-
-        # Post to listings + new-releases channels
-        await self._post_approved_plugin(interaction.guild, plugin, interaction.user)
-
-        await interaction.followup.send(
-            embed=success_embed("Approved", f"Plugin **{plugin['name']}** (ID `{plugin_id}`) approved!"),
-            ephemeral=True,
-        )
-
-        # Log
-        await self.bot.log_action(
-            interaction.guild,
-            log_embed("Plugin Approved", f"**{plugin['name']}** (ID `{plugin_id}`)", interaction.user, color=COLORS['green'])
-        )
-        logger.info(f"Plugin {plugin_id} approved by {interaction.user.id}")
-
-    # ── /reject ───────────────────────────────────────────────────────────────
-
-    @app_commands.command(name="reject", description="❌ [ADMIN] Reject a submitted plugin.")
-    @app_commands.describe(plugin_id="Plugin ID to reject", reason="Rejection reason")
-    @is_moderator()
-    async def reject(self, interaction: discord.Interaction, plugin_id: int, reason: str):
-        await interaction.response.defer(ephemeral=True)
-        plugin = await self.bot.db.get_plugin(plugin_id)
-        if not plugin:
-            await interaction.followup.send(embed=error_embed("Not Found", "Plugin not found."), ephemeral=True)
-            return
-
-        await self.bot.db.reject_plugin(plugin_id, reason)
-
-        # DM author
-        try:
-            author = self.bot.get_user(plugin['author_id'])
-            if author:
-                await author.send(embed=error_embed(
-                    "Plugin Rejected",
-                    f"Your plugin **{plugin['name']}** was **rejected**.\n**Reason:** {reason}\n\n"
-                    "You may fix the issue and re-upload.",
-                ))
-        except Exception:
-            pass
-
-        await interaction.followup.send(
-            embed=error_embed("Rejected", f"Plugin **{plugin['name']}** (ID `{plugin_id}`) rejected.\n**Reason:** {reason}"),
-            ephemeral=True,
-        )
-
-        await self.bot.log_action(
-            interaction.guild,
-            log_embed("Plugin Rejected", f"**{plugin['name']}** — {reason}", interaction.user, color=COLORS['red'])
-        )
-
-    # ── /pending ──────────────────────────────────────────────────────────────
-
-    @app_commands.command(name="pending", description="📥 [ADMIN] View all pending plugin submissions.")
-    @is_moderator()
-    async def pending(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)
-        plugins = await self.bot.db.get_plugins(pending=True, limit=20)
-
-        if not plugins:
-            await interaction.followup.send(embed=info_embed("No Pending Plugins", "All submissions have been reviewed!"), ephemeral=True)
-            return
-
-        embed = discord.Embed(title="📥 Pending Submissions", color=COLORS['orange'])
-        for p in plugins:
-            embed.add_field(
-                name=f"[{p['id']}] {'🔓' if p['is_leaked'] else '🧩'} {p['name']} v{p['version']}",
-                value=(
-                    f"> <@{p['author_id']}> • {p['plugin_type']} • {p['mc_version']}\n"
-                    f"> Use `/approve {p['id']}` or `/reject {p['id']} <reason>`"
-                ),
-                inline=False,
-            )
-        await interaction.followup.send(embed=embed, ephemeral=True)
 
     # ── /give-dropper ─────────────────────────────────────────────────────────
 
@@ -372,102 +261,7 @@ class AdminCog(commands.Cog):
             embed=success_embed("Commands Synced", f"Synced **{len(synced)}** slash commands."), ephemeral=True
         )
 
-    # ── Internal helpers ──────────────────────────────────────────────────────
-
-    async def _download_plugin_file(self, plugin) -> bytes | None:
-        """
-        Fetch the plugin's .jar bytes from Discord.
-
-        Strategy (in priority order):
-        1. Fetch the original pending-review message and grab its attachment
-           (most reliable — that message stays in the channel).
-        2. Fall back to the stored file_url in the DB.
-        """
-        # Try to get the file from the stored pending message
-        if plugin['msg_id'] and plugin['channel_id']:
-            try:
-                ch = self.bot.get_channel(int(plugin['channel_id']))
-                if ch:
-                    msg = await ch.fetch_message(int(plugin['msg_id']))
-                    if msg.attachments:
-                        url = msg.attachments[0].url
-                        async with aiohttp.ClientSession() as session:
-                            async with session.get(url) as resp:
-                                if resp.status == 200:
-                                    return await resp.read()
-            except Exception as exc:
-                logger.warning(f"Could not fetch from pending message: {exc}")
-
-        # Fallback: stored URL
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(plugin['file_url']) as resp:
-                    if resp.status == 200:
-                        return await resp.read()
-        except Exception as exc:
-            logger.error(f"Could not download plugin file: {exc}")
-
-        return None
-
-    async def _post_approved_plugin(self, guild: discord.Guild, plugin, approver: discord.Member):
-        """
-        Download the .jar and post to listings + new-releases (or leaked channel)
-        with the actual file attached — users click the Discord attachment to download.
-        """
-        plugin = await self.bot.db.get_plugin(plugin['id'])
-        author = guild.get_member(plugin['author_id'])
-        embed  = plugin_embed(plugin, author)
-
-        # Download the file once, re-use bytes for each channel
-        logger.info(f"Downloading plugin file for approval: plugin {plugin['id']}")
-        file_bytes = await self._download_plugin_file(plugin)
-
-        if not file_bytes:
-            logger.error(f"Could not obtain file bytes for plugin {plugin['id']}")
-
-        async def send_to_channel(ch: discord.TextChannel, content: str = None):
-            """Send embed + file attachment to a channel."""
-            if file_bytes:
-                disc_file = discord.File(
-                    io.BytesIO(file_bytes),
-                    filename=plugin['file_name'],
-                    description=f"{plugin['name']} v{plugin['version']} — ID {plugin['id']}",
-                )
-                await ch.send(content=content, embed=embed, file=disc_file)
-            else:
-                # No file available — send embed only (shouldn't normally happen)
-                await ch.send(content=content, embed=embed)
-
-        if not plugin['is_leaked']:
-            # ── new-releases ──────────────────────────────────────────────────
-            nr_id = await self.bot.db.get_config('ch_new_releases')
-            if nr_id:
-                ch = guild.get_channel(int(nr_id))
-                if ch:
-                    try:
-                        await send_to_channel(ch, content="🆕 **New Plugin Released!**")
-                    except Exception as exc:
-                        logger.error(f"Failed to post to new-releases: {exc}")
-
-            # ── listings ──────────────────────────────────────────────────────
-            lst_id = await self.bot.db.get_config('ch_listings')
-            if lst_id:
-                ch = guild.get_channel(int(lst_id))
-                if ch:
-                    try:
-                        await send_to_channel(ch)
-                    except Exception as exc:
-                        logger.error(f"Failed to post to listings: {exc}")
-        else:
-            # ── leaked channel ────────────────────────────────────────────────
-            lk_id = await self.bot.db.get_config('ch_leaked')
-            if lk_id:
-                ch = guild.get_channel(int(lk_id))
-                if ch:
-                    try:
-                        await send_to_channel(ch, content="🔓 **New Leaked Plugin!**")
-                    except Exception as exc:
-                        logger.error(f"Failed to post to leaked: {exc}")
+    # No internal helpers needed — plugins post themselves on drop.
 
 
 async def setup(bot):
