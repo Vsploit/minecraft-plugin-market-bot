@@ -70,20 +70,16 @@ class PluginPaginator(discord.ui.View):
 
 
 class PluginActionView(discord.ui.View):
-    """Buttons attached to a single plugin embed: Download, Rate, Report."""
+    """Buttons attached to a single plugin embed: Rate, Report.
+    (The file is now attached directly to the message — no expiring URL button needed.)
+    """
 
-    def __init__(self, plugin_id: int, file_url: str, file_name: str, bot, timeout: int = 180):
+    def __init__(self, plugin_id: int, bot, timeout: int = 180):
         super().__init__(timeout=timeout)
         self.plugin_id = plugin_id
         self.bot       = bot
-        # Add direct download link button
-        self.add_item(discord.ui.Button(
-            label=f"📥 Download {file_name}",
-            url=file_url,
-            style=discord.ButtonStyle.link,
-        ))
 
-    @discord.ui.button(label="⭐ Rate", style=discord.ButtonStyle.green, custom_id="rate_plugin")
+    @discord.ui.button(label="⭐ Rate This Plugin", style=discord.ButtonStyle.green, custom_id="rate_plugin")
     async def rate_btn(self, interaction: discord.Interaction, _):
         await interaction.response.send_modal(RatePluginModal(self.plugin_id, self.bot))
 
@@ -164,8 +160,29 @@ class ApproveRejectView(discord.ui.View):
         if not interaction.user.guild_permissions.manage_guild:
             await interaction.response.send_message("❌ No permission.", ephemeral=True)
             return
+        await interaction.response.defer(ephemeral=True)
         await self.bot.db.approve_plugin(self.plugin_id)
-        await interaction.response.send_message(f"✅ Plugin `{self.plugin_id}` approved!", ephemeral=True)
+
+        # Post to listings + new-releases with the actual file
+        plugin = await self.bot.db.get_plugin(self.plugin_id)
+        if plugin:
+            admin_cog = self.bot.cogs.get('AdminCog')
+            if admin_cog:
+                await admin_cog._post_approved_plugin(interaction.guild, plugin, interaction.user)
+
+            # DM the author
+            try:
+                author = self.bot.get_user(plugin['author_id'])
+                if author:
+                    from utils.embeds import success_embed
+                    await author.send(embed=success_embed(
+                        "Plugin Approved! 🎉",
+                        f"**{plugin['name']}** v{plugin['version']} is now live in the marketplace!"
+                    ))
+            except Exception:
+                pass
+
+        await interaction.followup.send(f"✅ Plugin `{self.plugin_id}` approved and posted to listings!", ephemeral=True)
         self.stop()
 
     @discord.ui.button(label="❌ Reject", style=discord.ButtonStyle.red, custom_id="reject_quick")

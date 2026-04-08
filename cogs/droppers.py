@@ -1,11 +1,15 @@
 """
 Dropper system — upload plugins, manage dropper profiles, approval workflow.
+Files are downloaded from the interaction attachment and re-uploaded to the
+pending-review channel so they persist (no expiring CDN links).
 """
 
 import discord
 from discord.ext import commands
 from discord import app_commands
 import logging
+import aiohttp
+import io
 from config import COLORS, PLUGIN_CATEGORIES, PLUGIN_TYPES, MC_VERSIONS
 from utils.checks import is_dropper
 from utils.embeds import success_embed, error_embed, info_embed, pending_embed, log_embed
@@ -14,14 +18,26 @@ from utils.paginator import ApproveRejectView
 logger = logging.getLogger('PluginMarket.Droppers')
 
 
+async def download_bytes(url: str) -> bytes | None:
+    """Download a file from a URL and return its raw bytes."""
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as resp:
+                if resp.status == 200:
+                    return await resp.read()
+    except Exception as exc:
+        logger.error(f"Failed to download {url}: {exc}")
+    return None
+
+
 # ── Upload Modal ──────────────────────────────────────────────────────────────
 
 class UploadPluginModal(discord.ui.Modal, title="🧩 Upload Plugin"):
-    p_name    = discord.ui.TextInput(label="Plugin Name",    placeholder="e.g. SuperEconomy",             max_length=64)
-    p_version = discord.ui.TextInput(label="Version",        placeholder="e.g. 1.0.0",                    max_length=20, default="1.0.0")
-    p_desc    = discord.ui.TextInput(label="Description",    placeholder="Describe what your plugin does.", style=discord.TextStyle.paragraph, max_length=1000)
-    p_tags    = discord.ui.TextInput(label="Tags (comma-separated)", placeholder="economy, shops, trade",  max_length=200, required=False)
-    p_source  = discord.ui.TextInput(label="Source URL (optional)", placeholder="https://github.com/...", required=False, max_length=200)
+    p_name    = discord.ui.TextInput(label="Plugin Name",               placeholder="e.g. SuperEconomy",             max_length=64)
+    p_version = discord.ui.TextInput(label="Version",                   placeholder="e.g. 1.0.0",                    max_length=20, default="1.0.0")
+    p_desc    = discord.ui.TextInput(label="Description",               placeholder="Describe what your plugin does.", style=discord.TextStyle.paragraph, max_length=1000)
+    p_tags    = discord.ui.TextInput(label="Tags (comma-separated)",    placeholder="economy, shops, trade",          max_length=200, required=False)
+    p_source  = discord.ui.TextInput(label="Source URL (optional)",    placeholder="https://github.com/...",         required=False, max_length=200)
 
     def __init__(self, bot, category: str, plugin_type: str, mc_version: str,
                  price: float, attachment: discord.Attachment, image_url: str = None):
@@ -37,18 +53,31 @@ class UploadPluginModal(discord.ui.Modal, title="🧩 Upload Plugin"):
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
 
-        # Validate file
-        if not self.attachment.filename.endswith('.jar'):
+        if not self.attachment.filename.lower().endswith('.jar'):
             await interaction.followup.send(embed=error_embed("Invalid File", "Only `.jar` files are accepted."), ephemeral=True)
             return
 
+        # ── Download the file from Discord's CDN right now ────────────────────
+        await interaction.followup.send(
+            embed=info_embed("Uploading…", "Downloading and saving your plugin file. Please wait…"),
+            ephemeral=True,
+        )
+
+        file_bytes = await download_bytes(self.attachment.url)
+        if not file_bytes:
+            await interaction.edit_original_response(
+                embed=error_embed("Download Failed", "Could not download your plugin file. Please try again.")
+            )
+            return
+
+        # ── Insert a 'placeholder' plugin row first so we have an ID ─────────
         plugin_id = await self.bot.db.add_plugin(
             name        = self.p_name.value.strip(),
             description = self.p_desc.value.strip(),
             version     = self.p_version.value.strip(),
             category    = self.category,
             tags        = self.p_tags.value.strip() if self.p_tags.value else '',
-            file_url    = self.attachment.url,
+            file_url    = self.attachment.url,   # temporary; updated below
             file_name   = self.attachment.filename,
             image_url   = self.image_url,
             author_id   = interaction.user.id,
@@ -62,39 +91,49 @@ class UploadPluginModal(discord.ui.Modal, title="🧩 Upload Plugin"):
 
         plugin = await self.bot.db.get_plugin(plugin_id)
 
-        # Increment dropper count
-        await self.bot.db.increment_drops(interaction.user.id)
-
-        await interaction.followup.send(
-            embed=success_embed(
-                "Plugin Submitted!",
-                f"Your plugin **{self.p_name.value}** (ID: `{plugin_id}`) has been submitted for review.\n"
-                "An admin will approve or reject it shortly. You'll receive a DM with the decision.",
-            ),
-            ephemeral=True,
-        )
-
-        # Post to pending channel
+        # ── Post to pending channel with ACTUAL file attached ─────────────────
         pending_ch_id = await self.bot.db.get_config('ch_pending')
         if pending_ch_id:
             ch = interaction.guild.get_channel(int(pending_ch_id))
             if ch:
-                embed = pending_embed(plugin, interaction.user.display_name)
-                view  = ApproveRejectView(plugin_id, self.bot)
-                await ch.send(embed=embed, view=view)
+                embed  = pending_embed(plugin, interaction.user.display_name)
+                view   = ApproveRejectView(plugin_id, self.bot)
+                disc_file = discord.File(
+                    io.BytesIO(file_bytes),
+                    filename=self.attachment.filename,
+                    description=f"Plugin ID {plugin_id} — {self.p_name.value}",
+                )
+                pending_msg = await ch.send(embed=embed, view=view, file=disc_file)
 
-        # Log action
+                # Update DB with the stable attachment URL from the pending msg
+                stable_url = pending_msg.attachments[0].url if pending_msg.attachments else self.attachment.url
+                await self.bot.db.update_plugin(
+                    plugin_id,
+                    file_url   = stable_url,
+                    msg_id     = pending_msg.id,
+                    channel_id = ch.id,
+                )
+
+        # Increment dropper drop count
+        await self.bot.db.increment_drops(interaction.user.id)
+
+        await interaction.edit_original_response(embed=success_embed(
+            "Plugin Submitted! 🎉",
+            f"**{self.p_name.value}** (ID: `{plugin_id}`) is now pending staff review.\n"
+            "You'll receive a DM when it's approved or rejected.",
+        ))
+
+        # Audit log
         log_e = log_embed(
             "Plugin Submitted",
-            f"**{self.p_name.value}** (ID `{plugin_id}`) submitted by {interaction.user.mention}",
+            f"**{self.p_name.value}** (ID `{plugin_id}`) by {interaction.user.mention}",
             interaction.user, color=COLORS['cyan'],
         )
         await self.bot.log_action(interaction.guild, log_e)
-
         logger.info(f"Plugin {plugin_id} submitted by {interaction.user} ({interaction.user.id})")
 
 
-# ── Category & Type selects ───────────────────────────────────────────────────
+# ── Category select → triggers modal ─────────────────────────────────────────
 
 class CategorySelect(discord.ui.Select):
     def __init__(self, bot, plugin_type: str, mc_version: str, price: float,
@@ -106,8 +145,8 @@ class CategorySelect(discord.ui.Select):
         self.attachment  = attachment
         self.image_url   = image_url
 
-        options = [discord.SelectOption(label=c, value=c) for c in PLUGIN_CATEGORIES]
-        super().__init__(placeholder="📂 Select a category…", options=options)
+        options = [discord.SelectOption(label=c, value=c, emoji="📂") for c in PLUGIN_CATEGORIES]
+        super().__init__(placeholder="📂 Select your plugin's category…", options=options, min_values=1, max_values=1)
 
     async def callback(self, interaction: discord.Interaction):
         await interaction.response.send_modal(
@@ -135,11 +174,11 @@ class DroppersCog(commands.Cog):
 
     @app_commands.command(name="upload", description="💧 Upload a Minecraft plugin to the marketplace.")
     @app_commands.describe(
-        plugin_file = "The .jar file to upload",
-        plugin_type = "Platform (Spigot, Paper, Fabric, etc.)",
+        plugin_file = "The .jar plugin file to upload",
+        plugin_type = "Server platform (Spigot, Paper, Fabric, etc.)",
         mc_version  = "Target Minecraft version",
-        price       = "Price in USD (0 for free)",
-        thumbnail   = "Optional thumbnail image",
+        price       = "Price in USD — enter 0 for free",
+        thumbnail   = "Optional thumbnail image for the listing",
     )
     @app_commands.choices(
         plugin_type=[app_commands.Choice(name=t, value=t) for t in PLUGIN_TYPES],
@@ -155,32 +194,35 @@ class DroppersCog(commands.Cog):
         price:       float = 0.0,
         thumbnail:   discord.Attachment = None,
     ):
-        # Validate file type
         if not plugin_file.filename.lower().endswith('.jar'):
             await interaction.response.send_message(
                 embed=error_embed("Invalid File", "Only `.jar` plugin files are accepted."), ephemeral=True
             )
             return
 
-        # File size check (25 MB max)
         if plugin_file.size > 25 * 1024 * 1024:
             await interaction.response.send_message(
-                embed=error_embed("File Too Large", "Plugin must be under 25 MB."), ephemeral=True
+                embed=error_embed("File Too Large", "Plugin must be under **25 MB**."), ephemeral=True
             )
             return
 
         image_url = thumbnail.url if thumbnail else None
 
         await interaction.response.send_message(
-            embed=info_embed("Select Category", "Choose a category for your plugin:"),
+            embed=info_embed(
+                "Step 2 — Choose a Category",
+                f"**File:** `{plugin_file.filename}` ({plugin_file.size // 1024:,} KB)\n"
+                f"**Type:** {plugin_type} | **MC:** {mc_version} | **Price:** {'Free' if price == 0 else f'${price:.2f}'}\n\n"
+                "Select a category below, then fill in the plugin details."
+            ),
             view=CategorySelectView(self.bot, plugin_type, mc_version, price, plugin_file, image_url),
             ephemeral=True,
         )
 
     # ── /dropper-profile ──────────────────────────────────────────────────────
 
-    @app_commands.command(name="dropper-profile", description="💧 View a dropper's profile.")
-    @app_commands.describe(member="The dropper to look up (defaults to you)")
+    @app_commands.command(name="dropper-profile", description="💧 View a dropper's public profile.")
+    @app_commands.describe(member="The dropper to look up (defaults to yourself)")
     async def dropper_profile(self, interaction: discord.Interaction, member: discord.Member = None):
         await interaction.response.defer()
         target = member or interaction.user
@@ -199,7 +241,7 @@ class DroppersCog(commands.Cog):
         embed.set_thumbnail(url=target.display_avatar.url)
 
         if row:
-            verified = "✅ Verified" if row['verified'] else "🟡 Standard"
+            verified = "✅ Verified Seller" if row['verified'] else "💧 Standard Dropper"
             embed.add_field(name="Status",          value=verified,              inline=True)
             embed.add_field(name="Total Drops",     value=f"**{row['drops_count']}**", inline=True)
             embed.add_field(name="Total Downloads", value=f"**{total_dl:,}**",    inline=True)
@@ -210,7 +252,7 @@ class DroppersCog(commands.Cog):
 
         if plugins:
             plist = "\n".join(
-                f"`[{p['id']}]` **{p['name']}** v{p['version']} — 📥{p['downloads']:,}"
+                f"`[{p['id']}]` **{p['name']}** v{p['version']} — 📥 {p['downloads']:,}"
                 for p in plugins
             )
             embed.add_field(name="📦 Top Plugins", value=plist, inline=False)
@@ -219,8 +261,8 @@ class DroppersCog(commands.Cog):
 
     # ── /set-bio ──────────────────────────────────────────────────────────────
 
-    @app_commands.command(name="set-bio", description="✏️ Set your dropper bio.")
-    @app_commands.describe(bio="Your bio (max 200 chars)")
+    @app_commands.command(name="set-bio", description="✏️ Set your dropper profile bio.")
+    @app_commands.describe(bio="Your bio (max 200 characters)")
     @is_dropper()
     async def set_bio(self, interaction: discord.Interaction, bio: str):
         await interaction.response.defer(ephemeral=True)
@@ -228,13 +270,13 @@ class DroppersCog(commands.Cog):
             "UPDATE droppers SET bio=? WHERE user_id=?", (bio[:200], interaction.user.id)
         )
         await interaction.followup.send(
-            embed=success_embed("Bio Updated", f"Your bio has been set to:\n> {bio[:200]}"), ephemeral=True
+            embed=success_embed("Bio Updated", f"Your bio:\n> {bio[:200]}"), ephemeral=True
         )
 
     # ── /update-plugin ────────────────────────────────────────────────────────
 
-    @app_commands.command(name="update-plugin", description="🔄 Update an existing plugin with a new version.")
-    @app_commands.describe(plugin_id="Plugin ID", new_file="New .jar file", new_version="New version string", changelog="What changed?")
+    @app_commands.command(name="update-plugin", description="🔄 Push a new version of one of your plugins.")
+    @app_commands.describe(plugin_id="Plugin ID to update", new_file="New .jar file", new_version="New version string (e.g. 1.2.0)", changelog="What changed in this version?")
     @is_dropper()
     async def update_plugin(
         self,
@@ -253,8 +295,15 @@ class DroppersCog(commands.Cog):
         if plugin['author_id'] != interaction.user.id and not interaction.user.guild_permissions.administrator:
             await interaction.followup.send(embed=error_embed("Permission Denied", "You don't own this plugin."), ephemeral=True)
             return
-        if not new_file.filename.endswith('.jar'):
-            await interaction.followup.send(embed=error_embed("Invalid File", "Only .jar files accepted."), ephemeral=True)
+        if not new_file.filename.lower().endswith('.jar'):
+            await interaction.followup.send(embed=error_embed("Invalid File", "Only `.jar` files accepted."), ephemeral=True)
+            return
+
+        await interaction.followup.send(embed=info_embed("Uploading…", "Saving new version…"), ephemeral=True)
+
+        file_bytes = await download_bytes(new_file.url)
+        if not file_bytes:
+            await interaction.edit_original_response(embed=error_embed("Download Failed", "Could not download the file."))
             return
 
         # Archive old version
@@ -263,26 +312,36 @@ class DroppersCog(commands.Cog):
             (plugin_id, plugin['version'], changelog, plugin['file_url'], plugin['file_name']),
         )
 
-        # Update plugin
+        # Post new file to pending
+        stable_url = new_file.url
+        pending_ch_id = await self.bot.db.get_config('ch_pending')
+        if pending_ch_id:
+            ch = interaction.guild.get_channel(int(pending_ch_id))
+            if ch:
+                disc_file = discord.File(io.BytesIO(file_bytes), filename=new_file.filename)
+                msg = await ch.send(
+                    content=f"🔄 **Update** for plugin `{plugin_id}` — **{plugin['name']}** → v{new_version}",
+                    file=disc_file,
+                )
+                if msg.attachments:
+                    stable_url = msg.attachments[0].url
+
         await self.bot.db.update_plugin(
             plugin_id,
             version   = new_version,
-            file_url  = new_file.url,
+            file_url  = stable_url,
             file_name = new_file.filename,
             approved  = 0,  # Needs re-approval
         )
 
-        await interaction.followup.send(
-            embed=success_embed(
-                "Plugin Updated",
-                f"**{plugin['name']}** updated to v{new_version}.\nIt's pending re-approval by staff.",
-            ),
-            ephemeral=True,
-        )
+        await interaction.edit_original_response(embed=success_embed(
+            "Plugin Updated",
+            f"**{plugin['name']}** updated to **v{new_version}** and is pending re-approval.",
+        ))
 
     # ── /delete-plugin ────────────────────────────────────────────────────────
 
-    @app_commands.command(name="delete-plugin", description="🗑️ Delete one of your plugins.")
+    @app_commands.command(name="delete-plugin", description="🗑️ Delete one of your plugins from the marketplace.")
     @app_commands.describe(plugin_id="Plugin ID to delete")
     @is_dropper()
     async def delete_plugin(self, interaction: discord.Interaction, plugin_id: int):
@@ -303,7 +362,7 @@ class DroppersCog(commands.Cog):
 
     # ── /version-history ─────────────────────────────────────────────────────
 
-    @app_commands.command(name="version-history", description="📜 View version history of a plugin.")
+    @app_commands.command(name="version-history", description="📜 View all past versions of a plugin.")
     @app_commands.describe(plugin_id="Plugin ID")
     async def version_history(self, interaction: discord.Interaction, plugin_id: int):
         await interaction.response.defer()
@@ -319,7 +378,7 @@ class DroppersCog(commands.Cog):
         embed = discord.Embed(title=f"📜 Version History — {plugin['name']}", color=COLORS['blurple'])
         embed.add_field(
             name=f"🟢 Current — v{plugin['version']}",
-            value=f"[{plugin['file_name']}]({plugin['file_url']})",
+            value=f"`{plugin['file_name']}`",
             inline=False,
         )
         for v in versions[:10]:

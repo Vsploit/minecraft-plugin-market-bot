@@ -120,7 +120,9 @@ class SetupCog(commands.Cog):
         # ── 4. Create roles ───────────────────────────────────────────────────
         await update("🎭 Creating roles… (40%)")
         created_roles: dict[str, discord.Role] = {}
-        for role_def in reversed(ROLES):  # Create from lowest to highest
+
+        # Create all roles first (they all appear at position 1 initially)
+        for role_def in ROLES:  # top→bottom order: Owner first, Buyer last
             try:
                 r = await guild.create_role(
                     name=role_def['name'],
@@ -131,11 +133,30 @@ class SetupCog(commands.Cog):
                     reason="Server setup",
                 )
                 created_roles[role_def['name']] = r
-                await asyncio.sleep(0.3)
+                await asyncio.sleep(0.4)
             except Exception as exc:
                 logger.error(f"Could not create role {role_def['name']}: {exc}")
 
-        # ── 5. Assign bot role ────────────────────────────────────────────────
+        # ── 5. Fix role hierarchy positions ───────────────────────────────────
+        # ROLES list is defined top→bottom (Owner=index 0).
+        # Discord position: higher int = higher in list = more power.
+        # @everyone is always 0. Bot's own managed role must stay above all.
+        await update("📊 Ordering role hierarchy… (48%)")
+        try:
+            # Build position map: Owner gets the highest slot, Buyer gets slot 1
+            total = len(ROLES)
+            position_map: dict[discord.Role, int] = {}
+            for idx, role_def in enumerate(ROLES):
+                role = created_roles.get(role_def['name'])
+                if role:
+                    # ROLES[0] = Owner → position (total), ROLES[-1] = Buyer → position 1
+                    position_map[role] = total - idx
+            await guild.edit_role_positions(positions=position_map, reason="Setup hierarchy")
+            await asyncio.sleep(0.5)
+        except Exception as exc:
+            logger.warning(f"Could not set role positions (may need higher bot role): {exc}")
+
+        # ── 5b. Assign bot role ───────────────────────────────────────────────
         if '🤖 Bot' in created_roles:
             try:
                 await guild.me.add_roles(created_roles['🤖 Bot'], reason="Setup")

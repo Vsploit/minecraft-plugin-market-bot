@@ -1,11 +1,16 @@
 """
 Admin cog — approve/reject plugins, manage roles, view reports, server config.
+
+On approval the bot downloads the plugin file and re-uploads it directly to
+the listings / new-releases channel so users get a native Discord download.
 """
 
 import discord
 from discord.ext import commands
 from discord import app_commands
 import logging
+import io
+import aiohttp
 from config import COLORS
 from utils.checks import is_admin, is_moderator
 from utils.embeds import (success_embed, error_embed, info_embed,
@@ -369,61 +374,98 @@ class AdminCog(commands.Cog):
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 
+    async def _download_plugin_file(self, plugin) -> bytes | None:
+        """
+        Fetch the plugin's .jar bytes from Discord.
+
+        Strategy (in priority order):
+        1. Fetch the original pending-review message and grab its attachment
+           (most reliable — that message stays in the channel).
+        2. Fall back to the stored file_url in the DB.
+        """
+        # Try to get the file from the stored pending message
+        if plugin['msg_id'] and plugin['channel_id']:
+            try:
+                ch = self.bot.get_channel(int(plugin['channel_id']))
+                if ch:
+                    msg = await ch.fetch_message(int(plugin['msg_id']))
+                    if msg.attachments:
+                        url = msg.attachments[0].url
+                        async with aiohttp.ClientSession() as session:
+                            async with session.get(url) as resp:
+                                if resp.status == 200:
+                                    return await resp.read()
+            except Exception as exc:
+                logger.warning(f"Could not fetch from pending message: {exc}")
+
+        # Fallback: stored URL
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(plugin['file_url']) as resp:
+                    if resp.status == 200:
+                        return await resp.read()
+        except Exception as exc:
+            logger.error(f"Could not download plugin file: {exc}")
+
+        return None
+
     async def _post_approved_plugin(self, guild: discord.Guild, plugin, approver: discord.Member):
-        """Post plugin to listings and new-releases channels after approval."""
-        # Re-fetch to get updated data
+        """
+        Download the .jar and post to listings + new-releases (or leaked channel)
+        with the actual file attached — users click the Discord attachment to download.
+        """
         plugin = await self.bot.db.get_plugin(plugin['id'])
         author = guild.get_member(plugin['author_id'])
-        embed = plugin_embed(plugin, author)
+        embed  = plugin_embed(plugin, author)
 
-        from utils.paginator import PluginActionView
+        # Download the file once, re-use bytes for each channel
+        logger.info(f"Downloading plugin file for approval: plugin {plugin['id']}")
+        file_bytes = await self._download_plugin_file(plugin)
 
-        # New releases
-        nr_id = await self.bot.db.get_config('ch_new_releases')
-        if nr_id:
-            ch = guild.get_channel(int(nr_id))
-            if ch:
-                view = discord.ui.View()
-                view.add_item(discord.ui.Button(
-                    label=f"📥 {plugin['file_name']}",
-                    url=plugin['file_url'],
-                    style=discord.ButtonStyle.link,
-                ))
-                try:
-                    await ch.send(content="🆕 **New Plugin!**", embed=embed, view=view)
-                except Exception as exc:
-                    logger.error(f"Failed to post to new-releases: {exc}")
+        if not file_bytes:
+            logger.error(f"Could not obtain file bytes for plugin {plugin['id']}")
 
-        # Listings channel (if not leaked)
+        async def send_to_channel(ch: discord.TextChannel, content: str = None):
+            """Send embed + file attachment to a channel."""
+            if file_bytes:
+                disc_file = discord.File(
+                    io.BytesIO(file_bytes),
+                    filename=plugin['file_name'],
+                    description=f"{plugin['name']} v{plugin['version']} — ID {plugin['id']}",
+                )
+                await ch.send(content=content, embed=embed, file=disc_file)
+            else:
+                # No file available — send embed only (shouldn't normally happen)
+                await ch.send(content=content, embed=embed)
+
         if not plugin['is_leaked']:
+            # ── new-releases ──────────────────────────────────────────────────
+            nr_id = await self.bot.db.get_config('ch_new_releases')
+            if nr_id:
+                ch = guild.get_channel(int(nr_id))
+                if ch:
+                    try:
+                        await send_to_channel(ch, content="🆕 **New Plugin Released!**")
+                    except Exception as exc:
+                        logger.error(f"Failed to post to new-releases: {exc}")
+
+            # ── listings ──────────────────────────────────────────────────────
             lst_id = await self.bot.db.get_config('ch_listings')
             if lst_id:
                 ch = guild.get_channel(int(lst_id))
                 if ch:
-                    view = discord.ui.View()
-                    view.add_item(discord.ui.Button(
-                        label=f"📥 {plugin['file_name']}",
-                        url=plugin['file_url'],
-                        style=discord.ButtonStyle.link,
-                    ))
                     try:
-                        await ch.send(embed=embed, view=view)
+                        await send_to_channel(ch)
                     except Exception as exc:
                         logger.error(f"Failed to post to listings: {exc}")
         else:
-            # Leaked channel
+            # ── leaked channel ────────────────────────────────────────────────
             lk_id = await self.bot.db.get_config('ch_leaked')
             if lk_id:
                 ch = guild.get_channel(int(lk_id))
                 if ch:
-                    view = discord.ui.View()
-                    view.add_item(discord.ui.Button(
-                        label=f"📥 {plugin['file_name']}",
-                        url=plugin['file_url'],
-                        style=discord.ButtonStyle.link,
-                    ))
                     try:
-                        await ch.send(embed=embed, view=view)
+                        await send_to_channel(ch, content="🔓 **New Leaked Plugin!**")
                     except Exception as exc:
                         logger.error(f"Failed to post to leaked: {exc}")
 

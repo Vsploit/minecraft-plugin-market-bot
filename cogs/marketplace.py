@@ -91,22 +91,49 @@ class MarketplaceCog(commands.Cog):
 
     # ── /plugin ───────────────────────────────────────────────────────────────
 
-    @app_commands.command(name="plugin", description="🧩 View detailed info about a specific plugin.")
+    @app_commands.command(name="plugin", description="🧩 View details and download a specific plugin.")
     @app_commands.describe(plugin_id="The numeric plugin ID")
     async def plugin_info(self, interaction: discord.Interaction, plugin_id: int):
         await interaction.response.defer()
         plugin = await self.bot.db.get_plugin(plugin_id)
-        if not plugin or (plugin['is_leaked'] and not self._has_leaked_access(interaction.user)):
-            await interaction.followup.send(embed=error_embed("Not Found", "Plugin not found or you don't have access."), ephemeral=True)
+        if not plugin or not plugin['approved']:
+            await interaction.followup.send(embed=error_embed("Not Found", "Plugin not found."), ephemeral=True)
+            return
+        if plugin['is_leaked'] and not self._has_leaked_access(interaction.user):
+            await interaction.followup.send(embed=error_embed("Access Denied", "You need the 🔓 Leaked Access role."), ephemeral=True)
             return
 
         author = interaction.guild.get_member(plugin['author_id'])
-        embed = plugin_embed(plugin, author)
+        embed  = plugin_embed(plugin, author)
+
+        # Download the actual .jar and attach it to the response
+        import aiohttp, io
+        file_bytes = None
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(plugin['file_url']) as resp:
+                    if resp.status == 200:
+                        file_bytes = await resp.read()
+        except Exception:
+            pass
 
         await self.bot.db.increment_downloads(plugin_id)
 
-        view = PluginActionView(plugin['id'], plugin['file_url'], plugin['file_name'], self.bot)
-        await interaction.followup.send(embed=embed, view=view)
+        # Include action buttons (Rate / Report) via the view
+        view = PluginActionView(plugin['id'], self.bot)
+
+        if file_bytes:
+            disc_file = discord.File(
+                io.BytesIO(file_bytes),
+                filename=plugin['file_name'],
+                description=f"{plugin['name']} v{plugin['version']}",
+            )
+            await interaction.followup.send(
+                content=f"📥 **{plugin['name']}** v{plugin['version']} — download the file below:",
+                embed=embed, file=disc_file, view=view,
+            )
+        else:
+            await interaction.followup.send(embed=embed, view=view)
 
     # ── /top ──────────────────────────────────────────────────────────────────
 
